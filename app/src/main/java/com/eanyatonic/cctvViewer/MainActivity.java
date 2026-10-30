@@ -17,13 +17,17 @@ import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -34,14 +38,19 @@ import androidx.preference.PreferenceManager;
 // X5内核代码
 import com.tencent.smtt.export.external.TbsCoreSettings;
 import com.tencent.smtt.export.external.extension.interfaces.IX5WebSettingsExtension;
+import com.tencent.smtt.export.external.interfaces.ConsoleMessage;
+import com.tencent.smtt.export.external.interfaces.IX5WebChromeClient;
 import com.tencent.smtt.sdk.QbSdk;
 import com.tencent.smtt.sdk.WebChromeClient;
 import com.tencent.smtt.sdk.WebSettings;
 import com.tencent.smtt.sdk.WebView;
 import com.tencent.smtt.sdk.WebViewClient;
 
+import java.util.ArrayDeque;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
+import java.util.WeakHashMap;
 
 // WebView内核代码
 //import android.webkit.SslErrorHandler;
@@ -133,6 +142,169 @@ public class MainActivity extends AppCompatActivity {
     private Boolean enableDirectChannelChange = false;
     private Boolean enableDirectBack = false;
 
+    // 调试开关（设置-其他设置，重启生效）
+    private boolean disableFastLoading = false;
+    private boolean disableAutoFullscreen = false;
+    private boolean disableLocalReload = false;
+    private boolean diagOverlayEnabled = false;
+
+    // 加载代次：把延迟回调与页面回调绑定到"发起时"的那次加载，避免快速换台互相干扰
+    private int loadGeneration = 0;
+    private final Map<WebView, Integer> viewLoadGeneration = new WeakHashMap<>();
+
+    // 页面触发 HTML5 全屏时的自定义 View（WebChromeClient.onShowCustomView）
+    private View customFullscreenView;
+    private IX5WebChromeClient.CustomViewCallback customFullscreenCallback;
+
+    // 诊断悬浮层
+    private TextView diagTextView;
+    private final ArrayDeque<String> eventLog = new ArrayDeque<>();
+    private String webViewVersionText = "";
+
+    // 页面加载期间的"轻量化清理"脚本：
+    // 只在播放器就绪前运行，且最多运行 10 秒；不再清空 <script src>（对已开始加载的脚本无效且可能打断页面初始化）
+    private static final String FAST_LOADING_JS = """
+            (function () {
+                if (window.__cctvFastLoading) { return; }
+                window.__cctvFastLoading = { start: Date.now(), done: false };
+                var MAX_MS = 10000;
+                function playerReady() {
+                    try {
+                        return !!(document.querySelector('video')
+                                || document.querySelector('[id^="player_pagefullscreen_"]')
+                                || document.querySelector('[isPageFullscreen]')
+                                || document.querySelector('.videoFull'));
+                    } catch (e) {
+                        return true;
+                    }
+                }
+                function clean() {
+                    try {
+                        var imgs = document.getElementsByTagName('img');
+                        for (var i = 0; i < imgs.length; i++) {
+                            if (imgs[i] && imgs[i].getAttribute('src')) { imgs[i].src = ''; }
+                        }
+                        var classNames = ['newmap', 'newtopbz', 'newtopbzTV', 'column_wrapper'];
+                        for (var c = 0; c < classNames.length; c++) {
+                            var els = document.getElementsByClassName(classNames[c]);
+                            for (var k = els.length - 1; k >= 0; k--) {
+                                if (els[k] && els[k].innerHTML) { els[k].innerHTML = ''; }
+                            }
+                        }
+                    } catch (e) {
+                    }
+                }
+                function tick() {
+                    var state = window.__cctvFastLoading;
+                    if (state.done) { return; }
+                    if (playerReady() || Date.now() - state.start > MAX_MS) {
+                        state.done = true;
+                        return;
+                    }
+                    clean();
+                    setTimeout(tick, 100);
+                }
+                tick();
+            })();
+            """;
+
+    // 自动全屏：等待播放器按钮出现后最多尝试 3 次点击，30 秒后放弃；
+    // 兼容央视（player_pagefullscreen_* + isPageFullscreen 属性）与央视频（.videoFull/.videoFull_ac）
+    private static final String AUTO_FULLSCREEN_JS = """
+            (function () {
+                if (window.__cctvAutoFullscreen) { return; }
+                var st = window.__cctvAutoFullscreen = { start: Date.now(), done: false, clicks: 0 };
+                var MAX_MS = 30000;
+                function cctvBtn() {
+                    try { return document.querySelector('[id^="player_pagefullscreen_"]'); } catch (e) { return null; }
+                }
+                function cctvOn(el) {
+                    try { return el.getAttribute('isPageFullscreen') === 'yes'; } catch (e) { return false; }
+                }
+                function yspEnter() {
+                    try { return document.querySelector('.videoFull:not([id])'); } catch (e) { return null; }
+                }
+                function yspOn() {
+                    try { return !!(document.querySelector('.videoFull[id]') || document.querySelector('.videoFull_ac')); } catch (e) { return false; }
+                }
+                function setVolume() {
+                    try { var v = document.querySelector('video'); if (v) { v.volume = 1; } } catch (e) { }
+                }
+                function tick() {
+                    if (st.done) { return; }
+                    if (Date.now() - st.start > MAX_MS) { st.done = true; return; }
+                    var b = cctvBtn();
+                    if (b) {
+                        if (cctvOn(b)) { st.done = true; setVolume(); return; }
+                        if (st.clicks < 3) { st.clicks++; try { b.click(); } catch (e) { } setVolume(); setTimeout(tick, 900); return; }
+                        st.done = true; return;
+                    }
+                    if (yspOn()) { st.done = true; setVolume(); return; }
+                    var yb = yspEnter();
+                    if (yb) {
+                        if (st.clicks < 3) { st.clicks++; try { yb.click(); } catch (e) { } setVolume(); setTimeout(tick, 900); return; }
+                        st.done = true; return;
+                    }
+                    setTimeout(tick, 100);
+                }
+                tick();
+            })();
+            """;
+
+    // 菜单"切换全屏"：按页面实际状态进入/退出，兼容两种页面
+    private static final String TOGGLE_FULLSCREEN_JS = """
+            (function () {
+                try {
+                    var cctv = document.querySelector('[id^="player_pagefullscreen_"]');
+                    if (cctv) { cctv.click(); return 'cctv'; }
+                    var ac = document.querySelector('.videoFull_ac');
+                    if (ac) { ac.click(); return 'ysp-exit'; }
+                    var enter = document.querySelector('.videoFull:not([id])');
+                    if (enter) { enter.click(); return 'ysp-enter'; }
+                    var rootFs = document.querySelector('.videoFull[id]');
+                    if (rootFs) { return 'ysp-already'; }
+                } catch (e) {
+                    return 'err:' + e;
+                }
+                return 'none';
+            })();
+            """;
+
+    // 诊断悬浮层数据采集
+    private static final String DIAG_JS = """
+            (function () {
+                try {
+                    var out = {
+                        fast: (window.__cctvFastLoading ? (window.__cctvFastLoading.done ? 'stopped' : 'running') : 'n/a'),
+                        auto: (window.__cctvAutoFullscreen ? (window.__cctvAutoFullscreen.done ? 'done' : 'running') : 'n/a')
+                    };
+                    var fs = document.querySelector('[id^="player_pagefullscreen_"]');
+                    if (fs) { out.fs = fs.getAttribute('isPageFullscreen') || 'no-attr'; }
+                    else if (document.querySelector('.videoFull_ac')) { out.fs = 'ysp-ac'; }
+                    else if (document.querySelector('.videoFull')) { out.fs = 'ysp-btn'; }
+                    else { out.fs = 'none'; }
+                    var v = document.querySelector('video');
+                    if (v) {
+                        out.rs = v.readyState;
+                        out.size = v.videoWidth + 'x' + v.videoHeight;
+                        try {
+                            out.buf = v.buffered.length ? Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10 : 0;
+                        } catch (e) { out.buf = -1; }
+                        if (v.getVideoPlaybackQuality) {
+                            var q = v.getVideoPlaybackQuality();
+                            out.drop = q.droppedVideoFrames + '/' + q.totalVideoFrames;
+                        }
+                    } else {
+                        out.video = 'none';
+                    }
+                    return JSON.stringify(out);
+                } catch (e) {
+                    return 'diagErr:' + e;
+                }
+            })();
+            """;
+
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -168,6 +340,25 @@ public class MainActivity extends AppCompatActivity {
 
         // 读取双缓冲设置
         enableDualWebView = sharedPreferences.getBoolean("dual_webview", false);
+
+        // 读取调试/诊断开关（重启生效）
+        disableFastLoading = sharedPreferences.getBoolean("disable_fast_loading", false);
+        disableAutoFullscreen = sharedPreferences.getBoolean("disable_auto_fullscreen", false);
+        disableLocalReload = sharedPreferences.getBoolean("disable_local_reload", false);
+        diagOverlayEnabled = sharedPreferences.getBoolean("diag_overlay", false);
+        if (diagOverlayEnabled || sharedPreferences.getBoolean("debug_mode", false)) {
+            try {
+                WebView.setWebContentsDebuggingEnabled(true);
+            } catch (Throwable ignored) {
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                try {
+                    android.webkit.WebView.setWebContentsDebuggingEnabled(true);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+
 
         // 读取WebView设置
         Boolean forceSysWebView = sharedPreferences.getBoolean("sys_webview", true);
@@ -303,6 +494,7 @@ public class MainActivity extends AppCompatActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { // Android 8.0+
             PackageInfo pkgInfo = WebView.getCurrentWebViewPackage();
             if (pkgInfo != null) {
+                webViewVersionText = String.valueOf(pkgInfo.versionName);
                 CoreText.setText("当前程序运行在系统WebView上，版本号：" + pkgInfo.versionName);
             }
         }
@@ -393,43 +585,13 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                // 页面加载时执行 JavaScript 脚本
-                view.evaluateJavascript(
-                        """
-                                function FastLoading() {
-                                             const fullscreenBtn = document.querySelector('#player_pagefullscreen_yes_player') || document.querySelector('.videoFull');
-                                             if (fullscreenBtn) return;
-
-                                             // 清空所有图片的 src 属性，阻止图片加载
-                                             Array.from(document.getElementsByTagName('img')).forEach(img => {
-                                                 img.src = '';
-                                             });
-
-                                             // 清空特定的脚本 src 属性
-                                             const scriptKeywords = ['login', 'index', 'daohang', 'grey', 'jquery'];
-                                             Array.from(document.getElementsByTagName('script')).forEach(script => {
-                                                 if (scriptKeywords.some(keyword => script.src.includes(keyword))) {
-                                                     script.src = '';
-                                                 }
-                                             });
-
-                                             // 清空具有特定 class 的 div 内容
-                                             const classNames = ['newmap', 'newtopbz', 'newtopbzTV', 'column_wrapper'];
-                                             classNames.forEach(className => {
-                                                 Array.from(document.getElementsByClassName(className)).forEach(div => {
-                                                     div.innerHTML = '';
-                                                 });
-                                             });
-
-                                             // 递归调用 FastLoading，每 4ms 触发一次
-                                             setTimeout(FastLoading, 4);
-                                         }
-
-                                         FastLoading();
-
-                                """,
-                        value -> {
-                        });
+                if (url == null || url.startsWith("about:")) {
+                    super.onPageStarted(view, url, favicon);
+                    return;
+                }
+                if (!disableFastLoading) {
+                    view.evaluateJavascript(FAST_LOADING_JS, null);
+                }
                 super.onPageStarted(view, url, favicon);
             }
 
@@ -439,6 +601,12 @@ public class MainActivity extends AppCompatActivity {
                 if (Objects.equals(url, "about:blank")) {
                     return;
                 }
+                // 只处理"当前代次"的加载结果，过期回调直接丢弃（快速换台时防止互相干扰）
+                Integer finishGeneration = viewLoadGeneration.get(view);
+                if (finishGeneration == null || finishGeneration.intValue() != loadGeneration) {
+                    return;
+                }
+                addEvent("finish #" + finishGeneration + " " + shortUrl(url));
                 // 清空info
                 info = "";
 
@@ -469,30 +637,15 @@ public class MainActivity extends AppCompatActivity {
                                 }
                             });
                 }
-                view.evaluateJavascript(
-                        """
-
-                                     function AutoFullscreen(){
-                                         var fullscreenBtn = document.querySelector('#player_pagefullscreen_yes_player')||document.querySelector('.videoFull');
-                                         if(fullscreenBtn!=null){
-                                            //alert(fullscreenBtn)
-                                          fullscreenBtn.click();
-                                          document.querySelector('video').volume=1;
-                                         }else{
-                                             setTimeout(
-                                                ()=>{ AutoFullscreen();}
-                                            ,16);
-                                         }
-                                     }
-                                AutoFullscreen()
-                                """,
-                        value -> {
-                        });
-                new Handler().postDelayed(() -> {
-                    // // 模拟触摸
-                    // if (!canLoadX5) {
-                    // simulateTouch(view, 0.5f, 0.5f);
-                    // }
+                if (!disableAutoFullscreen) {
+                    view.evaluateJavascript(AUTO_FULLSCREEN_JS, null);
+                }
+                final int genForUi = finishGeneration.intValue();
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    Integer currentGen = viewLoadGeneration.get(view);
+                    if (currentGen == null || currentGen.intValue() != genForUi || isFinishing() || isDestroyed()) {
+                        return;
+                    }
                     // 隐藏加载的 View
                     loadingOverlay.setVisibility(View.GONE);
                     webView0.setVisibility(View.VISIBLE);
@@ -525,43 +678,13 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                // 页面加载时执行 JavaScript 脚本
-                view.evaluateJavascript(
-                        """
-                                function FastLoading() {
-                                             const fullscreenBtn = document.querySelector('#player_pagefullscreen_yes_player') || document.querySelector('.videoFull');
-                                             if (fullscreenBtn) return;
-
-                                             // 清空所有图片的 src 属性，阻止图片加载
-                                             Array.from(document.getElementsByTagName('img')).forEach(img => {
-                                                 img.src = '';
-                                             });
-
-                                             // 清空特定的脚本 src 属性
-                                             const scriptKeywords = ['login', 'index', 'daohang', 'grey', 'jquery'];
-                                             Array.from(document.getElementsByTagName('script')).forEach(script => {
-                                                 if (scriptKeywords.some(keyword => script.src.includes(keyword))) {
-                                                     script.src = '';
-                                                 }
-                                             });
-
-                                             // 清空具有特定 class 的 div 内容
-                                             const classNames = ['newmap', 'newtopbz', 'newtopbzTV', 'column_wrapper'];
-                                             classNames.forEach(className => {
-                                                 Array.from(document.getElementsByClassName(className)).forEach(div => {
-                                                     div.innerHTML = '';
-                                                 });
-                                             });
-
-                                             // 递归调用 FastLoading，每 4ms 触发一次
-                                             setTimeout(FastLoading, 4);
-                                         }
-
-                                         FastLoading();
-
-                                """,
-                        value -> {
-                        });
+                if (url == null || url.startsWith("about:")) {
+                    super.onPageStarted(view, url, favicon);
+                    return;
+                }
+                if (!disableFastLoading) {
+                    view.evaluateJavascript(FAST_LOADING_JS, null);
+                }
                 super.onPageStarted(view, url, favicon);
             }
 
@@ -571,6 +694,12 @@ public class MainActivity extends AppCompatActivity {
                 if (Objects.equals(url, "about:blank")) {
                     return;
                 }
+                // 只处理"当前代次"的加载结果，过期回调直接丢弃（快速换台时防止互相干扰）
+                Integer finishGeneration = viewLoadGeneration.get(view);
+                if (finishGeneration == null || finishGeneration.intValue() != loadGeneration) {
+                    return;
+                }
+                addEvent("finish #" + finishGeneration + " " + shortUrl(url));
                 // 清空info
                 info = "";
 
@@ -601,30 +730,15 @@ public class MainActivity extends AppCompatActivity {
                                 }
                             });
                 }
-                view.evaluateJavascript(
-                        """
-
-                                     function AutoFullscreen(){
-                                         var fullscreenBtn = document.querySelector('#player_pagefullscreen_yes_player')||document.querySelector('.videoFull');
-                                         if(fullscreenBtn!=null){
-                                            //alert(fullscreenBtn)
-                                          fullscreenBtn.click();
-                                          document.querySelector('video').volume=1;
-                                         }else{
-                                             setTimeout(
-                                                ()=>{ AutoFullscreen();}
-                                            ,16);
-                                         }
-                                     }
-                                AutoFullscreen()
-                                """,
-                        value -> {
-                        });
-                new Handler().postDelayed(() -> {
-                    // // 模拟触摸
-                    // if (!canLoadX5) {
-                    // simulateTouch(view, 0.5f, 0.5f);
-                    // }
+                if (!disableAutoFullscreen) {
+                    view.evaluateJavascript(AUTO_FULLSCREEN_JS, null);
+                }
+                final int genForUi = finishGeneration.intValue();
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    Integer currentGen = viewLoadGeneration.get(view);
+                    if (currentGen == null || currentGen.intValue() != genForUi || isFinishing() || isDestroyed()) {
+                        return;
+                    }
                     // 隐藏加载的 View
                     loadingOverlay.setVisibility(View.GONE);
 
@@ -659,9 +773,9 @@ public class MainActivity extends AppCompatActivity {
             webView0.getSettingsExtension().setPicModel(IX5WebSettingsExtension.PicModel_NoPic);
             webView1.getSettingsExtension().setPicModel(IX5WebSettingsExtension.PicModel_NoPic);
         }
-        // 设置 WebView 客户端
-        webView0.setWebChromeClient(new WebChromeClient());
-        webView1.setWebChromeClient(new WebChromeClient());
+        // 设置 WebView 客户端（含 HTML5 全屏接管与页面 console 日志）
+        webView0.setWebChromeClient(new FullscreenWebChromeClient());
+        webView1.setWebChromeClient(new FullscreenWebChromeClient());
 
         // 按照设置关闭双缓冲
         if (!enableDualWebView) {
@@ -673,6 +787,11 @@ public class MainActivity extends AppCompatActivity {
 
         // 启动定时任务，每隔一定时间执行一次
         // startPeriodicTask();
+
+        // 诊断悬浮层（默认关闭）
+        if (diagOverlayEnabled) {
+            startDiagOverlay();
+        }
 
     }
 
@@ -766,7 +885,8 @@ public class MainActivity extends AppCompatActivity {
                         case 1:
                             // 播放
                             if (currentLiveIndex <= 19) {
-                                simulateTouch(getCurrentWebview(), 0.5f, 0.5f);
+                                View currentView = getCurrentWebview();
+                                simulateTouch(currentView, currentView.getWidth() / 2f, currentView.getHeight() / 2f);
                             } else if (currentLiveIndex <= 40) {
                                 String scriptPause = """
                                         try{
@@ -780,28 +900,9 @@ public class MainActivity extends AppCompatActivity {
                             showMenuOverlay();
                             break;
                         case 2:
-                            // 切换全屏
-                            String script1 = """
-                                    console.log('点击全屏按钮');
-                                    document.querySelector('#player_pagefullscreen_yes_player').click();
-                                    """;
-
-                            String script2 = """
-                                    console.log('点击全屏按钮');
-                                    if(document.querySelector('.videoFull').id == ''){
-                                        document.querySelector('.videoFull').click();
-                                    }else{
-                                        document.querySelector('.videoFull_ac').click();
-                                    }
-                                    """;
-
-                            if (currentLiveIndex <= 19) {
-                                getCurrentWebview().evaluateJavascript(script1, null);
-                            } else if (currentLiveIndex <= 40) {
-                                new Handler().postDelayed(() -> {
-                                    getCurrentWebview().evaluateJavascript(script2, null);
-                                }, 500);
-                            }
+                            // 切换全屏（按页面实际状态进入/退出，兼容央视与央视频）
+                            getCurrentWebview().evaluateJavascript(TOGGLE_FULLSCREEN_JS,
+                                    value -> addEvent("toggleFullscreen -> " + value));
                             break;
                         case 3:
                             // 放大
@@ -1050,6 +1151,11 @@ public class MainActivity extends AppCompatActivity {
 
                 return true; // 事件已处理，不传递给 WebView
             } else if (event.getKeyCode() == KeyEvent.KEYCODE_BACK || event.getKeyCode() == KeyEvent.KEYCODE_B) {
+                if (customFullscreenView != null) {
+                    // 页面 HTML5 全屏状态下，先退出全屏
+                    hideCustomFullscreen();
+                    return true;
+                }
                 if (doubleBackToExitPressedOnce) {
                     super.onBackPressed();
                     System.exit(0);
@@ -1203,16 +1309,26 @@ public class MainActivity extends AppCompatActivity {
                 currentWebView = 0;
             }
 
-            getCurrentWebview().setInitialScale(getMinimumScale());
-            getCurrentWebview().loadUrl(liveUrls[currentLiveIndex]);
-            if (currentLiveIndex > 19) {
-                new Handler().postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (getCurrentWebview() != null) {
-                            getCurrentWebview().setInitialScale(getMinimumScale());
-                            getCurrentWebview().reload();
-                        }
+            // 代次 + 记录目标 WebView，避免延迟 reload 打到换台后的新页面上
+            loadGeneration++;
+            final int generation = loadGeneration;
+            final WebView target = getCurrentWebview();
+            viewLoadGeneration.put(target, generation);
+
+            target.setInitialScale(getMinimumScale());
+            target.loadUrl(liveUrls[currentLiveIndex]);
+            addEvent("load #" + generation + " " + channelNames[currentLiveIndex]);
+
+            if (currentLiveIndex > 19 && !disableLocalReload) {
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    if (isFinishing() || isDestroyed()) {
+                        return;
+                    }
+                    Integer currentGen = viewLoadGeneration.get(target);
+                    if (currentGen != null && currentGen.intValue() == generation && target == getCurrentWebview()) {
+                        target.setInitialScale(getMinimumScale());
+                        target.reload();
+                        addEvent("reload #" + generation);
                     }
                 }, 1000);
             }
@@ -1271,6 +1387,200 @@ public class MainActivity extends AppCompatActivity {
         upEvent.recycle();
     }
 
+    // 接管页面触发的 HTML5 全屏（无此实现时，requestFullScreen 会静默失败）
+    private class FullscreenWebChromeClient extends WebChromeClient {
+        @Override
+        public void onShowCustomView(View view, IX5WebChromeClient.CustomViewCallback callback) {
+            showCustomFullscreen(view, callback);
+        }
+
+        @Override
+        public void onShowCustomView(View view, int requestedOrientation,
+                IX5WebChromeClient.CustomViewCallback callback) {
+            showCustomFullscreen(view, callback);
+        }
+
+        @Override
+        public void onHideCustomView() {
+            hideCustomFullscreen();
+        }
+
+        @Override
+        public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
+            try {
+                if (consoleMessage != null && consoleMessage.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                    addEvent("JS " + consoleMessage.message());
+                }
+            } catch (Throwable ignored) {
+            }
+            return true;
+        }
+    }
+
+    private void showCustomFullscreen(View view, IX5WebChromeClient.CustomViewCallback callback) {
+        if (customFullscreenView != null) {
+            if (callback != null) {
+                callback.onCustomViewHidden();
+            }
+            return;
+        }
+        customFullscreenView = view;
+        customFullscreenCallback = callback;
+        try {
+            ViewGroup root = findViewById(android.R.id.content);
+            if (root != null) {
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+                root.addView(view, lp);
+            }
+        } catch (Throwable t) {
+            Log.e("fullscreen", "showCustomFullscreen addView failed", t);
+        }
+        setImmersiveMode(true);
+        addEvent("fullscreen enter");
+    }
+
+    private void hideCustomFullscreen() {
+        if (customFullscreenView == null) {
+            return;
+        }
+        try {
+            ViewGroup root = findViewById(android.R.id.content);
+            if (root != null) {
+                root.removeView(customFullscreenView);
+            }
+        } catch (Throwable t) {
+            Log.e("fullscreen", "hideCustomFullscreen removeView failed", t);
+        }
+        customFullscreenView = null;
+        IX5WebChromeClient.CustomViewCallback callback = customFullscreenCallback;
+        customFullscreenCallback = null;
+        if (callback != null) {
+            try {
+                callback.onCustomViewHidden();
+            } catch (Throwable ignored) {
+            }
+        }
+        setImmersiveMode(false);
+        addEvent("fullscreen exit");
+    }
+
+    private void setImmersiveMode(boolean enable) {
+        try {
+            View decorView = getWindow().getDecorView();
+            if (enable) {
+                int flags = View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+                    flags |= View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                    flags |= View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
+                }
+                decorView.setSystemUiVisibility(flags);
+            } else {
+                decorView.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+            }
+        } catch (Throwable t) {
+            Log.e("fullscreen", "setImmersiveMode failed", t);
+        }
+    }
+
+    // 诊断悬浮层：默认关闭，在设置-其他设置里开启（重启生效）
+    private void startDiagOverlay() {
+        if (diagTextView != null) {
+            return;
+        }
+        try {
+            ViewGroup root = findViewById(android.R.id.content);
+            if (root == null) {
+                return;
+            }
+            diagTextView = new TextView(this);
+            diagTextView.setTextSize(11);
+            diagTextView.setTextColor(0xFFFFFFFF);
+            diagTextView.setBackgroundColor(0x88000000);
+            diagTextView.setPadding(16, 10, 16, 10);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP | Gravity.END);
+            lp.setMargins(16, 16, 16, 16);
+            root.addView(diagTextView, lp);
+            handler.post(diagTask);
+        } catch (Throwable t) {
+            Log.e("diag", "startDiagOverlay failed", t);
+        }
+    }
+
+    private void stopDiagOverlay() {
+        handler.removeCallbacks(diagTask);
+    }
+
+    private final Runnable diagTask = new Runnable() {
+        @Override
+        public void run() {
+            updateDiagOverlay();
+            handler.postDelayed(this, 2000);
+        }
+    };
+
+    private void updateDiagOverlay() {
+        if (diagTextView == null) {
+            return;
+        }
+        WebView webView = getCurrentWebview();
+        if (webView == null) {
+            return;
+        }
+        webView.evaluateJavascript(DIAG_JS, value -> {
+            if (diagTextView == null) {
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            try {
+                sb.append("ch#").append(loadGeneration).append(' ')
+                        .append(channelNames[currentLiveIndex]).append('\n');
+            } catch (Throwable ignored) {
+            }
+            sb.append("webview ").append(webViewVersionText).append('\n');
+            String diag = value == null ? "null" : value;
+            if (diag.length() > 160) {
+                diag = diag.substring(0, 160);
+            }
+            sb.append(diag).append('\n');
+            int shown = 0;
+            for (String line : eventLog) {
+                sb.append(line).append('\n');
+                if (++shown >= 6) {
+                    break;
+                }
+            }
+            diagTextView.setText(sb.toString());
+        });
+    }
+
+    private void addEvent(String event) {
+        try {
+            String line = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                    .format(new java.util.Date()) + " " + event;
+            eventLog.addFirst(line);
+            while (eventLog.size() > 30) {
+                eventLog.removeLast();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static String shortUrl(String url) {
+        try {
+            java.net.URL parsed = new java.net.URL(url);
+            String path = parsed.getPath();
+            return path == null || path.isEmpty() ? url : path;
+        } catch (Throwable t) {
+            return url == null ? "" : (url.length() > 60 ? url.substring(0, 60) : url);
+        }
+    }
+
     private void showOverlay(String channelInfo) {
         // 设置覆盖层内容
         overlayTextView.setText(channelInfo);
@@ -1285,6 +1595,12 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        // 清理所有延迟任务（延迟 reload、诊断刷新等）
+        handler.removeCallbacksAndMessages(null);
+        stopDiagOverlay();
+        diagTextView = null;
+        customFullscreenView = null;
+        customFullscreenCallback = null;
         // 在销毁活动时，释放 WebView 资源
         if (webView0 != null) {
             webView0.destroy();

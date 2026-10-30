@@ -54,6 +54,30 @@
         android:title="启用调试模式"
         android:summary="解除设置界面所有设置项的不可选限制"
         android:defaultValue="false" />
+
+    <SwitchPreference
+        android:key="disable_fast_loading"
+        android:title="禁用元素精简脚本"
+        android:summary="排查卡顿用：关闭换台时的页面元素精简循环（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
+        android:key="disable_auto_fullscreen"
+        android:title="禁用自动全屏"
+        android:summary="排查用：关闭页面加载后的自动全屏逻辑（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
+        android:key="disable_local_reload"
+        android:title="禁用地方台1秒重载"
+        android:summary="排查用：关闭地方台加载1秒后的自动页面重载（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
+        android:key="diag_overlay"
+        android:title="显示诊断悬浮层"
+        android:summary="在屏幕上显示播放与脚本循环状态，用于反馈问题（重启生效）"
+        android:defaultValue="false" />
 </PreferenceCategory>
 
 <PreferenceCategory android:title="关于">
