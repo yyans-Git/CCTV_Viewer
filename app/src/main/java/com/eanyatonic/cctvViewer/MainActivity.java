@@ -149,6 +149,9 @@ public class MainActivity extends AppCompatActivity {
     private boolean diagOverlayEnabled = false;
     private boolean preferLowQuality = false;
     private int fastInjectCount = 0;
+    private boolean disableLowDelay = false;
+    private boolean allowImages = false;
+    private int resourceErrorCount = 0;
 
     // 加载代次：把延迟回调与页面回调绑定到"发起时"的那次加载，避免快速换台互相干扰
     private int loadGeneration = 0;
@@ -182,9 +185,11 @@ public class MainActivity extends AppCompatActivity {
                 }
                 function clean() {
                     try {
-                        var imgs = document.getElementsByTagName('img');
-                        for (var i = 0; i < imgs.length; i++) {
-                            if (imgs[i] && imgs[i].getAttribute('src')) { imgs[i].src = ''; }
+                        if (!window.__cctvAllowImages) {
+                            var imgs = document.getElementsByTagName('img');
+                            for (var i = 0; i < imgs.length; i++) {
+                                if (imgs[i] && imgs[i].getAttribute('src')) { imgs[i].src = ''; }
+                            }
                         }
                         var classNames = ['newmap', 'newtopbz', 'newtopbzTV', 'column_wrapper'];
                         for (var c = 0; c < classNames.length; c++) {
@@ -272,6 +277,52 @@ public class MainActivity extends AppCompatActivity {
             })();
             """;
 
+    // 低延迟关闭脚本：必须早于 liveplayer.js 注入
+    // 通过属性拦截让页面里的 isLowDelayLivePlayer=!![] 赋值失效（保持 false），使播放器改用标准 HLS
+    private static final String LOW_DELAY_OFF_JS = """
+            (function () {
+                try {
+                    if (window.__cctvLowDelayDisabled) { return; }
+                    window.__cctvLowDelayDisabled = true;
+                    var v = false;
+                    Object.defineProperty(window, 'isLowDelayLivePlayer', {
+                        configurable: true,
+                        get: function () { return v; },
+                        set: function () { }
+                    });
+                } catch (e) { }
+            })();
+            """;
+
+    // 统计播放器重建与 VDN 错误重试次数（诊断用，包裹全局函数）
+    private static final String HOOKS_JS = """
+            (function () {
+                if (window.__cctvHooks) { return; }
+                window.__cctvHooks = {};
+                var tries = 0;
+                function wrap(name) {
+                    try {
+                        var orig = window[name];
+                        if (typeof orig === 'function' && !orig.__cctvWrapped) {
+                            var f = function () {
+                                window.__cctvHooks[name] = (window.__cctvHooks[name] || 0) + 1;
+                                return orig.apply(this, arguments);
+                            };
+                            f.__cctvWrapped = true;
+                            window[name] = f;
+                        }
+                    } catch (e) { }
+                }
+                function tick() {
+                    if (tries++ > 120) { return; }
+                    wrap('createH5LivePlayerElement');
+                    wrap('parseLiveDataFromVdnWhenError');
+                    setTimeout(tick, 500);
+                }
+                tick();
+            })();
+            """;
+
     // 诊断悬浮层数据采集（输出单行纯文本，便于拍屏）
     private static final String DIAG_JS = """
             (function () {
@@ -305,7 +356,17 @@ public class MainActivity extends AppCompatActivity {
                         try { if (!vids[i].paused && !vids[i].ended) { playing++; } } catch (e) { }
                     }
                     out.push('vids=' + vids.length + '/play' + playing);
+                    var hooks = window.__cctvHooks || {};
+                    out.push('reinit=' + (hooks.createH5LivePlayerElement || 0)
+                            + ' vdnErr=' + (hooks.parseLiveDataFromVdnWhenError || 0));
                     var v = document.querySelector('video');
+                    if (v) {
+                        if (window.__cctvLastVideo && window.__cctvLastVideo !== v) {
+                            window.__cctvSwaps = (window.__cctvSwaps || 0) + 1;
+                        }
+                        window.__cctvLastVideo = v;
+                    }
+                    out.push('swaps=' + (window.__cctvSwaps || 0));
                     if (v) {
                         var buf = -1;
                         try {
@@ -441,6 +502,8 @@ public class MainActivity extends AppCompatActivity {
         disableLocalReload = sharedPreferences.getBoolean("disable_local_reload", false);
         diagOverlayEnabled = sharedPreferences.getBoolean("diag_overlay", false);
         preferLowQuality = sharedPreferences.getBoolean("prefer_low_quality", false);
+        disableLowDelay = sharedPreferences.getBoolean("disable_low_delay", false);
+        allowImages = sharedPreferences.getBoolean("allow_images", false);
         if (diagOverlayEnabled || sharedPreferences.getBoolean("debug_mode", false)) {
             try {
                 WebView.setWebContentsDebuggingEnabled(true);
@@ -624,8 +687,8 @@ public class MainActivity extends AppCompatActivity {
         webSettings.setJavaScriptEnabled(true);
         webSettings.setDomStorageEnabled(true);
         webSettings.setDatabaseEnabled(true);
-        webSettings.setLoadsImagesAutomatically(false); // 禁用自动加载图片
-        webSettings.setBlockNetworkImage(true); // 禁用网络图片加载
+        webSettings.setLoadsImagesAutomatically(allowImages); // 默认禁用自动加载图片
+        webSettings.setBlockNetworkImage(!allowImages); // 默认禁用网络图片加载
         webSettings.setMediaPlaybackRequiresUserGesture(false);
         webSettings.setUserAgent(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36");
@@ -641,8 +704,8 @@ public class MainActivity extends AppCompatActivity {
         webSettings1.setJavaScriptEnabled(true);
         webSettings1.setDomStorageEnabled(true);
         webSettings1.setDatabaseEnabled(true);
-        webSettings1.setLoadsImagesAutomatically(false); // 禁用自动加载图片
-        webSettings1.setBlockNetworkImage(true); // 禁用网络图片加载
+        webSettings1.setLoadsImagesAutomatically(allowImages); // 默认禁用自动加载图片
+        webSettings1.setBlockNetworkImage(!allowImages); // 默认禁用网络图片加载
         webSettings1.setMediaPlaybackRequiresUserGesture(false);
         webSettings1.setUserAgent(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36");
@@ -671,6 +734,24 @@ public class MainActivity extends AppCompatActivity {
                 handler.proceed(); // 忽略 SSL 错误
             }
 
+            @Override
+            public void onReceivedError(com.tencent.smtt.sdk.WebView webView,
+                    com.tencent.smtt.export.external.interfaces.WebResourceRequest request,
+                    com.tencent.smtt.export.external.interfaces.WebResourceError error) {
+                try {
+                    if (request != null && request.isForMainFrame()) {
+                        addEvent("pageErr " + (error == null ? -1 : error.getErrorCode()) + " "
+                                + shortUrl(String.valueOf(request.getUrl())));
+                    } else {
+                        resourceErrorCount++;
+                        if (resourceErrorCount <= 5) {
+                            addEvent("resErr " + shortUrl(String.valueOf(request.getUrl())));
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
             // 系统Webview内核代码
             // @Override
             // public void onReceivedSslError(WebView view, SslErrorHandler handler,
@@ -684,6 +765,13 @@ public class MainActivity extends AppCompatActivity {
                     super.onPageStarted(view, url, favicon);
                     return;
                 }
+                if (disableLowDelay) {
+                    view.evaluateJavascript(LOW_DELAY_OFF_JS, null);
+                }
+                if (allowImages) {
+                    view.evaluateJavascript("window.__cctvAllowImages=true;", null);
+                }
+                view.evaluateJavascript(HOOKS_JS, null);
                 if (!disableFastLoading) {
                     fastInjectCount++;
                     view.evaluateJavascript(FAST_LOADING_JS, null);
@@ -768,6 +856,24 @@ public class MainActivity extends AppCompatActivity {
                 handler.proceed(); // 忽略 SSL 错误
             }
 
+            @Override
+            public void onReceivedError(com.tencent.smtt.sdk.WebView webView,
+                    com.tencent.smtt.export.external.interfaces.WebResourceRequest request,
+                    com.tencent.smtt.export.external.interfaces.WebResourceError error) {
+                try {
+                    if (request != null && request.isForMainFrame()) {
+                        addEvent("pageErr " + (error == null ? -1 : error.getErrorCode()) + " "
+                                + shortUrl(String.valueOf(request.getUrl())));
+                    } else {
+                        resourceErrorCount++;
+                        if (resourceErrorCount <= 5) {
+                            addEvent("resErr " + shortUrl(String.valueOf(request.getUrl())));
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
             // 系统Webview内核代码
             // @Override
             // public void onReceivedSslError(WebView view, SslErrorHandler handler,
@@ -781,6 +887,13 @@ public class MainActivity extends AppCompatActivity {
                     super.onPageStarted(view, url, favicon);
                     return;
                 }
+                if (disableLowDelay) {
+                    view.evaluateJavascript(LOW_DELAY_OFF_JS, null);
+                }
+                if (allowImages) {
+                    view.evaluateJavascript("window.__cctvAllowImages=true;", null);
+                }
+                view.evaluateJavascript(HOOKS_JS, null);
                 if (!disableFastLoading) {
                     fastInjectCount++;
                     view.evaluateJavascript(FAST_LOADING_JS, null);
@@ -871,8 +984,8 @@ public class MainActivity extends AppCompatActivity {
         webView0.setFocusable(false);
         webView1.setFocusable(false);
 
-        // 开启无图（X5内核）
-        if (canLoadX5) {
+        // 开启无图（X5内核，允许图片时不启用）
+        if (canLoadX5 && !allowImages) {
             webView0.getSettingsExtension().setPicModel(IX5WebSettingsExtension.PicModel_NoPic);
             webView1.getSettingsExtension().setPicModel(IX5WebSettingsExtension.PicModel_NoPic);
         }
@@ -1650,6 +1763,9 @@ public class MainActivity extends AppCompatActivity {
                     .append(" auto=").append(disableAutoFullscreen ? "off" : "on")
                     .append(" reload=").append(disableLocalReload ? "off" : "on")
                     .append(" lowq=").append(preferLowQuality ? "on" : "off")
+                    .append(" lowdelay=").append(disableLowDelay ? "off" : "on")
+                    .append(" images=").append(allowImages ? "on" : "off")
+                    .append(" resErr=").append(resourceErrorCount)
                     .append('\n');
             sb.append("webview ").append(webViewVersionText).append('\n');
             String diag = value == null ? "null" : value;

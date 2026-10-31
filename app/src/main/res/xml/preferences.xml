@@ -80,6 +80,18 @@
         android:defaultValue="false" />
 
     <SwitchPreference
+        android:key="disable_low_delay"
+        android:title="禁用低延迟直播"
+        android:summary="排查卡顿用：强制播放器改用标准 HLS，缓解频繁重连/刷新（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
+        android:key="allow_images"
+        android:title="允许加载页面图片"
+        android:summary="排查用：恢复图片加载，海报/占位图不再显示为破图（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
         android:key="diag_overlay"
         android:title="显示诊断悬浮层"
         android:summary="在屏幕上显示播放与脚本循环状态，用于反馈问题（重启生效）"
