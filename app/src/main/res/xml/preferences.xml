@@ -74,6 +74,12 @@
         android:defaultValue="false" />
 
     <SwitchPreference
+        android:key="prefer_low_quality"
+        android:title="卡顿时自动降低清晰度"
+        android:summary="仅央视台：尝试切到标清/流畅，并暂停页面里多余的在播视频（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
         android:key="diag_overlay"
         android:title="显示诊断悬浮层"
         android:summary="在屏幕上显示播放与脚本循环状态，用于反馈问题（重启生效）"

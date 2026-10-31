@@ -147,6 +147,8 @@ public class MainActivity extends AppCompatActivity {
     private boolean disableAutoFullscreen = false;
     private boolean disableLocalReload = false;
     private boolean diagOverlayEnabled = false;
+    private boolean preferLowQuality = false;
+    private int fastInjectCount = 0;
 
     // 加载代次：把延迟回调与页面回调绑定到"发起时"的那次加载，避免快速换台互相干扰
     private int loadGeneration = 0;
@@ -270,37 +272,129 @@ public class MainActivity extends AppCompatActivity {
             })();
             """;
 
-    // 诊断悬浮层数据采集
+    // 诊断悬浮层数据采集（输出单行纯文本，便于拍屏）
     private static final String DIAG_JS = """
             (function () {
                 try {
-                    var out = {
-                        fast: (window.__cctvFastLoading ? (window.__cctvFastLoading.done ? 'stopped' : 'running') : 'n/a'),
-                        auto: (window.__cctvAutoFullscreen ? (window.__cctvAutoFullscreen.done ? 'done' : 'running') : 'n/a')
-                    };
+                    var out = [];
+                    var f = window.__cctvFastLoading;
+                    out.push('fast=' + (f ? (f.done ? 'stopped' : 'running') : 'not-run'));
+                    var a = window.__cctvAutoFullscreen;
+                    out.push('auto=' + (a ? (a.done ? 'done' : 'running') : 'not-run'));
+                    var lq = window.__cctvLowQuality;
+                    out.push('lowq=' + (lq ? lq.result : 'off'));
                     var fs = document.querySelector('[id^="player_pagefullscreen_"]');
-                    if (fs) { out.fs = fs.getAttribute('isPageFullscreen') || 'no-attr'; }
-                    else if (document.querySelector('.videoFull_ac')) { out.fs = 'ysp-ac'; }
-                    else if (document.querySelector('.videoFull')) { out.fs = 'ysp-btn'; }
-                    else { out.fs = 'none'; }
+                    if (fs) { out.push('fs=' + (fs.getAttribute('isPageFullscreen') || 'no-attr')); }
+                    else if (document.querySelector('.videoFull_ac')) { out.push('fs=ysp-ac'); }
+                    else if (document.querySelector('.videoFull')) { out.push('fs=ysp-btn'); }
+                    else { out.push('fs=none'); }
+                    var q = null;
+                    try {
+                        if (window.LiveResolutionBar && LiveResolutionBar.prototype.getResolution) {
+                            q = String(LiveResolutionBar.prototype.getResolution('player'));
+                        }
+                    } catch (e) { }
+                    if (!q) {
+                        var showEl = document.getElementById('player_resolution_show_player');
+                        if (showEl) { q = showEl.getAttribute('activeResolution') || showEl.textContent || null; }
+                    }
+                    out.push('q=' + (q || '?'));
+                    var vids = document.querySelectorAll('video');
+                    var playing = 0;
+                    for (var i = 0; i < vids.length; i++) {
+                        try { if (!vids[i].paused && !vids[i].ended) { playing++; } } catch (e) { }
+                    }
+                    out.push('vids=' + vids.length + '/play' + playing);
                     var v = document.querySelector('video');
                     if (v) {
-                        out.rs = v.readyState;
-                        out.size = v.videoWidth + 'x' + v.videoHeight;
+                        var buf = -1;
                         try {
-                            out.buf = v.buffered.length ? Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10 : 0;
-                        } catch (e) { out.buf = -1; }
+                            buf = v.buffered.length ? Math.round((v.buffered.end(v.buffered.length - 1) - v.currentTime) * 10) / 10 : 0;
+                        } catch (e) { }
+                        var drop = -1, total = -1, delta = -1;
                         if (v.getVideoPlaybackQuality) {
-                            var q = v.getVideoPlaybackQuality();
-                            out.drop = q.droppedVideoFrames + '/' + q.totalVideoFrames;
+                            var qq = v.getVideoPlaybackQuality();
+                            drop = qq.droppedVideoFrames;
+                            total = qq.totalVideoFrames;
+                            var prev = window.__cctvDiagPrev;
+                            if (prev && typeof prev.drop === 'number' && prev.drop >= 0) { delta = drop - prev.drop; }
+                            window.__cctvDiagPrev = { drop: drop, ts: Date.now() };
                         }
+                        out.push('video=' + v.videoWidth + 'x' + v.videoHeight + ' rs=' + v.readyState
+                                + ' buf=' + buf + ' drop=' + drop + '/' + total + '(+' + delta + ')');
                     } else {
-                        out.video = 'none';
+                        out.push('video=none');
                     }
-                    return JSON.stringify(out);
+                    return out.join(' | ');
                 } catch (e) {
                     return 'diagErr:' + e;
                 }
+            })();
+            """;
+
+    // 低清晰度尝试（仅央视台，需在设置中开启）：
+    // 1) 暂停页面上多余的在播 <video>（多路并发解码会导致丢帧）
+    // 2) 通过播放器清晰度菜单把码率切到 标清(p480)/流畅(p360)/高清(p540)
+    private static final String LOW_QUALITY_JS = """
+            (function () {
+                if (window.__cctvLowQuality) { return; }
+                var st = window.__cctvLowQuality = { start: Date.now(), done: false, result: 'waiting', clicks: 0 };
+                var MAX_MS = 30000;
+                var divId = 'player';
+                var want = ['p480', 'p360', 'p540'];
+                function current() {
+                    try {
+                        if (window.LiveResolutionBar && LiveResolutionBar.prototype.getResolution) {
+                            return String(LiveResolutionBar.prototype.getResolution(divId));
+                        }
+                    } catch (e) { }
+                    return null;
+                }
+                function pauseExtraVideos() {
+                    try {
+                        var vids = document.querySelectorAll('video');
+                        var main = null, mainArea = -1;
+                        for (var i = 0; i < vids.length; i++) {
+                            var r = vids[i].getBoundingClientRect();
+                            var area = (r.width || 0) * (r.height || 0);
+                            if (area > mainArea) { mainArea = area; main = vids[i]; }
+                        }
+                        for (var j = 0; j < vids.length; j++) {
+                            if (vids[j] !== main && !vids[j].paused) {
+                                try { vids[j].pause(); st.pausedExtra = (st.pausedExtra || 0) + 1; } catch (e) { }
+                            }
+                        }
+                    } catch (e) { }
+                }
+                function tick() {
+                    if (st.done) { return; }
+                    if (Date.now() - st.start > MAX_MS) { st.result = 'timeout'; st.done = true; return; }
+                    try {
+                        if (!window.livePlayerObjs || !livePlayerObjs[divId]) { setTimeout(tick, 500); return; }
+                        pauseExtraVideos();
+                        var c = current();
+                        if (c === 'p480' || c === 'p360') { st.result = 'ok:' + c; st.done = true; return; }
+                        if (st.clicks >= 2) { st.result = 'stuck:' + c; st.done = true; return; }
+                        var arr = (livePlayerObjs[divId].resolutionArr || []).slice();
+                        for (var i = 0; i < want.length; i++) {
+                            if (arr.indexOf(want[i]) < 0) { continue; }
+                            var el = document.getElementById('resolution_item_' + want[i] + '_' + divId);
+                            if (el) {
+                                st.clicks++;
+                                st.result = 'click:' + want[i];
+                                el.click();
+                                setTimeout(tick, 1500);
+                                return;
+                            }
+                        }
+                        st.result = 'no-items:' + arr.join(',');
+                        st.done = true;
+                    } catch (e) {
+                        st.result = 'err:' + e;
+                        st.done = true;
+                    }
+                }
+                setTimeout(tick, 1500);
             })();
             """;
 
@@ -346,6 +440,7 @@ public class MainActivity extends AppCompatActivity {
         disableAutoFullscreen = sharedPreferences.getBoolean("disable_auto_fullscreen", false);
         disableLocalReload = sharedPreferences.getBoolean("disable_local_reload", false);
         diagOverlayEnabled = sharedPreferences.getBoolean("diag_overlay", false);
+        preferLowQuality = sharedPreferences.getBoolean("prefer_low_quality", false);
         if (diagOverlayEnabled || sharedPreferences.getBoolean("debug_mode", false)) {
             try {
                 WebView.setWebContentsDebuggingEnabled(true);
@@ -590,6 +685,7 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
                 if (!disableFastLoading) {
+                    fastInjectCount++;
                     view.evaluateJavascript(FAST_LOADING_JS, null);
                 }
                 super.onPageStarted(view, url, favicon);
@@ -639,6 +735,9 @@ public class MainActivity extends AppCompatActivity {
                 }
                 if (!disableAutoFullscreen) {
                     view.evaluateJavascript(AUTO_FULLSCREEN_JS, null);
+                }
+                if (preferLowQuality && currentLiveIndex <= 19) {
+                    view.evaluateJavascript(LOW_QUALITY_JS, null);
                 }
                 final int genForUi = finishGeneration.intValue();
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
@@ -683,6 +782,7 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
                 if (!disableFastLoading) {
+                    fastInjectCount++;
                     view.evaluateJavascript(FAST_LOADING_JS, null);
                 }
                 super.onPageStarted(view, url, favicon);
@@ -732,6 +832,9 @@ public class MainActivity extends AppCompatActivity {
                 }
                 if (!disableAutoFullscreen) {
                     view.evaluateJavascript(AUTO_FULLSCREEN_JS, null);
+                }
+                if (preferLowQuality && currentLiveIndex <= 19) {
+                    view.evaluateJavascript(LOW_QUALITY_JS, null);
                 }
                 final int genForUi = finishGeneration.intValue();
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
@@ -1542,10 +1645,16 @@ public class MainActivity extends AppCompatActivity {
                         .append(channelNames[currentLiveIndex]).append('\n');
             } catch (Throwable ignored) {
             }
+            sb.append("flags fast=").append(disableFastLoading ? "off" : "on")
+                    .append('(').append(fastInjectCount).append(')')
+                    .append(" auto=").append(disableAutoFullscreen ? "off" : "on")
+                    .append(" reload=").append(disableLocalReload ? "off" : "on")
+                    .append(" lowq=").append(preferLowQuality ? "on" : "off")
+                    .append('\n');
             sb.append("webview ").append(webViewVersionText).append('\n');
             String diag = value == null ? "null" : value;
-            if (diag.length() > 160) {
-                diag = diag.substring(0, 160);
+            if (diag.length() > 400) {
+                diag = diag.substring(0, 400);
             }
             sb.append(diag).append('\n');
             int shown = 0;
