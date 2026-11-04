@@ -152,7 +152,11 @@ public class MainActivity extends AppCompatActivity {
     private boolean disableLowDelay = false;
     private boolean allowImages = false;
     private boolean disableP2p = false;
+    private boolean delayPlaylist = false;
     private int resourceErrorCount = 0;
+    private int playlistTrimCount = 0;
+    private int playlistTrimErrors = 0;
+    private static final int PLAYLIST_TRIM_COUNT = 2;
 
     // 加载代次：把延迟回调与页面回调绑定到"发起时"的那次加载，避免快速换台互相干扰
     private int loadGeneration = 0;
@@ -227,7 +231,7 @@ public class MainActivity extends AppCompatActivity {
                     try { return document.querySelector('[id^="player_pagefullscreen_"]'); } catch (e) { return null; }
                 }
                 function cctvOn(el) {
-                    try { return el.getAttribute('isPageFullscreen') === 'yes'; } catch (e) { return false; }
+                    try { var v = el.getAttribute('isPageFullscreen'); return v === 'yes' || v === 'true'; } catch (e) { return false; }
                 }
                 function yspEnter() {
                     try { return document.querySelector('.videoFull:not([id])'); } catch (e) { return null; }
@@ -513,6 +517,7 @@ public class MainActivity extends AppCompatActivity {
         disableLowDelay = sharedPreferences.getBoolean("disable_low_delay", false);
         allowImages = sharedPreferences.getBoolean("allow_images", false);
         disableP2p = sharedPreferences.getBoolean("disable_p2p", false);
+        delayPlaylist = sharedPreferences.getBoolean("delay_playlist", false);
         if (diagOverlayEnabled || sharedPreferences.getBoolean("debug_mode", false)) {
             try {
                 WebView.setWebContentsDebuggingEnabled(true);
@@ -779,13 +784,20 @@ public class MainActivity extends AppCompatActivity {
                     com.tencent.smtt.sdk.WebView view,
                     com.tencent.smtt.export.external.interfaces.WebResourceRequest request) {
                 try {
-                    if (disableP2p && request != null && request.getUrl() != null) {
+                    if (request != null && request.getUrl() != null) {
                         String requestUrl = request.getUrl().toString();
-                        if (requestUrl.contains("hlsp2p")) {
+                        if (disableP2p && requestUrl.contains("hlsp2p")) {
                             addEvent("blockP2p");
                             return new com.tencent.smtt.export.external.interfaces.WebResourceResponse(
                                     "text/javascript", "utf-8",
                                     new java.io.ByteArrayInputStream(new byte[0]));
+                        }
+                        if (delayPlaylist && requestUrl.contains(".m3u8")) {
+                            com.tencent.smtt.export.external.interfaces.WebResourceResponse response =
+                                    interceptPlaylist(requestUrl);
+                            if (response != null) {
+                                return response;
+                            }
                         }
                     }
                 } catch (Throwable ignored) {
@@ -837,14 +849,18 @@ public class MainActivity extends AppCompatActivity {
 
                 if (currentLiveIndex <= 19) {
                     // 获取节目预告和当前节目
-                    view.evaluateJavascript("document.querySelector('#jiemu > li.cur.act').innerText", value -> {
+                    view.evaluateJavascript(
+                            "(function(){try{var el=document.querySelector('#jiemu > li.cur.act');return el?el.innerText:'';}catch(e){return '';}})()",
+                            value -> {
                         // 处理获取到的元素值
                         if (!value.equals("null") && !value.isEmpty()) {
                             String elementValueNow = value.replace("\"", ""); // 去掉可能的引号
                             info += elementValueNow + "\n";
                         }
                     });
-                    view.evaluateJavascript("document.querySelector('#jiemu > li:nth-child(4)').innerText", value -> {
+                    view.evaluateJavascript(
+                            "(function(){try{var el=document.querySelector('#jiemu > li:nth-child(4)');return el?el.innerText:'';}catch(e){return '';}})()",
+                            value -> {
                         // 处理获取到的元素值
                         if (!value.equals("null") && !value.isEmpty()) {
                             String elementValueNext = value.replace("\"", ""); // 去掉可能的引号
@@ -854,7 +870,7 @@ public class MainActivity extends AppCompatActivity {
                 } else if (currentLiveIndex <= 40) {
                     // 获取当前节目
                     view.evaluateJavascript(
-                            "document.getElementsByClassName(\"tvSelectJiemu\")[0].innerHTML + \" \" + document.getElementsByClassName(\"tvSelectJiemu\")[1].innerHTML",
+                            "(function(){try{var a=document.getElementsByClassName('tvSelectJiemu');return ((a[0]?a[0].innerHTML:'')+' '+(a[1]?a[1].innerHTML:''));}catch(e){return '';}})()",
                             value -> {
                                 if (!value.equals("null") && !value.isEmpty()) {
                                     String elementValueNow = value.replace("\"", ""); // 去掉可能的引号
@@ -933,13 +949,20 @@ public class MainActivity extends AppCompatActivity {
                     com.tencent.smtt.sdk.WebView view,
                     com.tencent.smtt.export.external.interfaces.WebResourceRequest request) {
                 try {
-                    if (disableP2p && request != null && request.getUrl() != null) {
+                    if (request != null && request.getUrl() != null) {
                         String requestUrl = request.getUrl().toString();
-                        if (requestUrl.contains("hlsp2p")) {
+                        if (disableP2p && requestUrl.contains("hlsp2p")) {
                             addEvent("blockP2p");
                             return new com.tencent.smtt.export.external.interfaces.WebResourceResponse(
                                     "text/javascript", "utf-8",
                                     new java.io.ByteArrayInputStream(new byte[0]));
+                        }
+                        if (delayPlaylist && requestUrl.contains(".m3u8")) {
+                            com.tencent.smtt.export.external.interfaces.WebResourceResponse response =
+                                    interceptPlaylist(requestUrl);
+                            if (response != null) {
+                                return response;
+                            }
                         }
                     }
                 } catch (Throwable ignored) {
@@ -991,14 +1014,18 @@ public class MainActivity extends AppCompatActivity {
 
                 if (currentLiveIndex <= 19) {
                     // 获取节目预告和当前节目
-                    view.evaluateJavascript("document.querySelector('#jiemu > li.cur.act').innerText", value -> {
+                    view.evaluateJavascript(
+                            "(function(){try{var el=document.querySelector('#jiemu > li.cur.act');return el?el.innerText:'';}catch(e){return '';}})()",
+                            value -> {
                         // 处理获取到的元素值
                         if (!value.equals("null") && !value.isEmpty()) {
                             String elementValueNow = value.replace("\"", ""); // 去掉可能的引号
                             info += elementValueNow + "\n";
                         }
                     });
-                    view.evaluateJavascript("document.querySelector('#jiemu > li:nth-child(4)').innerText", value -> {
+                    view.evaluateJavascript(
+                            "(function(){try{var el=document.querySelector('#jiemu > li:nth-child(4)');return el?el.innerText:'';}catch(e){return '';}})()",
+                            value -> {
                         // 处理获取到的元素值
                         if (!value.equals("null") && !value.isEmpty()) {
                             String elementValueNext = value.replace("\"", ""); // 去掉可能的引号
@@ -1008,7 +1035,7 @@ public class MainActivity extends AppCompatActivity {
                 } else if (currentLiveIndex <= 40) {
                     // 获取当前节目
                     view.evaluateJavascript(
-                            "document.getElementsByClassName(\"tvSelectJiemu\")[0].innerHTML + \" \" + document.getElementsByClassName(\"tvSelectJiemu\")[1].innerHTML",
+                            "(function(){try{var a=document.getElementsByClassName('tvSelectJiemu');return ((a[0]?a[0].innerHTML:'')+' '+(a[1]?a[1].innerHTML:''));}catch(e){return '';}})()",
                             value -> {
                                 if (!value.equals("null") && !value.isEmpty()) {
                                     String elementValueNow = value.replace("\"", ""); // 去掉可能的引号
@@ -1856,8 +1883,10 @@ public class MainActivity extends AppCompatActivity {
                     .append(" lowq=").append(preferLowQuality ? "on" : "off")
                     .append(" lowdelay=").append(disableLowDelay ? "off" : "on")
                     .append(" p2p=").append(disableP2p ? "off" : "on")
+                    .append(" delay=").append(delayPlaylist ? "on" : "off")
                     .append(" images=").append(allowImages ? "on" : "off")
                     .append(" resErr=").append(resourceErrorCount)
+                    .append(" pl=").append(playlistTrimCount)
                     .append('\n');
             sb.append("webview ").append(webViewVersionText).append('\n');
             String diag = value == null ? "null" : value;
@@ -1866,10 +1895,12 @@ public class MainActivity extends AppCompatActivity {
             }
             sb.append(diag).append('\n');
             int shown = 0;
-            for (String line : eventLog) {
-                sb.append(line).append('\n');
-                if (++shown >= 6) {
-                    break;
+            synchronized (eventLog) {
+                for (String line : eventLog) {
+                    sb.append(line).append('\n');
+                    if (++shown >= 6) {
+                        break;
+                    }
                 }
             }
             diagTextView.setText(sb.toString());
@@ -1880,9 +1911,11 @@ public class MainActivity extends AppCompatActivity {
         try {
             String line = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
                     .format(new java.util.Date()) + " " + event;
-            eventLog.addFirst(line);
-            while (eventLog.size() > 30) {
-                eventLog.removeLast();
+            synchronized (eventLog) {
+                eventLog.addFirst(line);
+                while (eventLog.size() > 30) {
+                    eventLog.removeLast();
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -1895,6 +1928,83 @@ public class MainActivity extends AppCompatActivity {
             return path == null || path.isEmpty() ? url : path;
         } catch (Throwable t) {
             return url == null ? "" : (url.length() > 60 ? url.substring(0, 60) : url);
+        }
+    }
+
+    // 直播缓冲增强：拦截媒体 m3u8，去掉最新的 N 个分片，让播放器落后直播边缘约 N*4 秒，换取稳定缓冲
+    private com.tencent.smtt.export.external.interfaces.WebResourceResponse interceptPlaylist(String url) {
+        if (url.contains("index.m3u8")) {
+            return null; // 主播放列表（含多档清晰度）交给 WebView 自己拉取
+        }
+        java.net.HttpURLConnection conn = null;
+        try {
+            conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setRequestProperty("User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36");
+            conn.setRequestProperty("Referer", "https://tv.cctv.com/");
+            if (conn.getResponseCode() != 200) {
+                return null;
+            }
+            java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
+            java.util.List<String> lines = new java.util.ArrayList<>();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lines.add(line);
+            }
+            reader.close();
+            StringBuilder content = new StringBuilder();
+            for (String item : lines) {
+                content.append(item).append('\n');
+            }
+            if (content.indexOf("#EXT-X-STREAM-INF") < 0) {
+                java.util.List<int[]> segments = new java.util.ArrayList<>();
+                for (int i = 0; i + 1 < lines.size(); i++) {
+                    if (lines.get(i).startsWith("#EXTINF")) {
+                        segments.add(new int[] { i, i + 1 });
+                    }
+                }
+                int trim = Math.min(PLAYLIST_TRIM_COUNT, Math.max(0, segments.size() - 2));
+                for (int k = 0; k < trim; k++) {
+                    int[] pair = segments.get(segments.size() - 1 - k);
+                    lines.set(pair[0], null);
+                    lines.set(pair[1], null);
+                }
+                content.setLength(0);
+                for (String item : lines) {
+                    if (item != null) {
+                        content.append(item).append('\n');
+                    }
+                }
+                playlistTrimCount++;
+                if (playlistTrimCount <= 3) {
+                    addEvent("playlist trim x" + trim);
+                }
+            }
+            com.tencent.smtt.export.external.interfaces.WebResourceResponse response =
+                    new com.tencent.smtt.export.external.interfaces.WebResourceResponse(
+                            "application/vnd.apple.mpegurl", "utf-8",
+                            new java.io.ByteArrayInputStream(content.toString().getBytes("UTF-8")));
+            java.util.Map<String, String> headers = new java.util.HashMap<>();
+            headers.put("Access-Control-Allow-Origin", "*");
+            headers.put("Cache-Control", "no-cache");
+            response.setResponseHeaders(headers);
+            return response;
+        } catch (Throwable t) {
+            playlistTrimErrors++;
+            if (playlistTrimErrors <= 3) {
+                addEvent("playlist err");
+            }
+            return null;
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                }
+            }
         }
     }
 

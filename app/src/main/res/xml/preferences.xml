@@ -92,6 +92,12 @@
         android:defaultValue="false" />
 
     <SwitchPreference
+        android:key="delay_playlist"
+        android:title="直播缓冲增强"
+        android:summary="排查卡顿用：拦截直播分片列表去掉最新2片，播放器落后约8秒换取稳定缓冲（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
         android:key="allow_images"
         android:title="允许加载页面图片"
         android:summary="排查用：恢复图片加载，海报/占位图不再显示为破图（重启生效）"
