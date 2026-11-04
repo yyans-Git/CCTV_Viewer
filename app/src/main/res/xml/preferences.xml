@@ -86,6 +86,12 @@
         android:defaultValue="false" />
 
     <SwitchPreference
+        android:key="disable_p2p"
+        android:title="禁用P2P传输"
+        android:summary="排查卡顿用：禁止播放器加载 P2P 模块，只用 CDN 直连（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
         android:key="allow_images"
         android:title="允许加载页面图片"
         android:summary="排查用：恢复图片加载，海报/占位图不再显示为破图（重启生效）"

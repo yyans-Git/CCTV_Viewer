@@ -151,6 +151,7 @@ public class MainActivity extends AppCompatActivity {
     private int fastInjectCount = 0;
     private boolean disableLowDelay = false;
     private boolean allowImages = false;
+    private boolean disableP2p = false;
     private int resourceErrorCount = 0;
 
     // 加载代次：把延迟回调与页面回调绑定到"发起时"的那次加载，避免快速换台互相干扰
@@ -277,22 +278,19 @@ public class MainActivity extends AppCompatActivity {
             })();
             """;
 
-    // 低延迟关闭脚本：必须早于 liveplayer.js 注入
-    // 通过属性拦截让页面里的 isLowDelayLivePlayer=!![] 赋值失效（保持 false），使播放器改用标准 HLS
-    private static final String LOW_DELAY_OFF_JS = """
-            (function () {
-                try {
-                    if (window.__cctvLowDelayDisabled) { return; }
-                    window.__cctvLowDelayDisabled = true;
-                    var v = false;
-                    Object.defineProperty(window, 'isLowDelayLivePlayer', {
-                        configurable: true,
-                        get: function () { return v; },
-                        set: function () { }
-                    });
-                } catch (e) { }
-            })();
-            """;
+    // 早期守卫脚本（必须在 liveplayer.js 加载前注入，仅用于央视台）：
+    // 通过属性拦截让页面里的 isLowDelayLivePlayer / isLiveEnableP2p 赋值失效，从而关闭低延迟与 P2P 传输
+    private String buildEarlyGuardJs() {
+        StringBuilder sb = new StringBuilder("(function(){try{");
+        if (disableLowDelay) {
+            sb.append("var v=false;Object.defineProperty(window,'isLowDelayLivePlayer',{configurable:true,get:function(){return v;},set:function(){}});");
+        }
+        if (disableP2p) {
+            sb.append("var p=false;Object.defineProperty(window,'isLiveEnableP2p',{configurable:true,get:function(){return p;},set:function(){}});");
+        }
+        sb.append("}catch(e){}})();");
+        return sb.toString();
+    }
 
     // 统计播放器重建与 VDN 错误重试次数（诊断用，包裹全局函数）
     private static final String HOOKS_JS = """
@@ -504,6 +502,7 @@ public class MainActivity extends AppCompatActivity {
         preferLowQuality = sharedPreferences.getBoolean("prefer_low_quality", false);
         disableLowDelay = sharedPreferences.getBoolean("disable_low_delay", false);
         allowImages = sharedPreferences.getBoolean("allow_images", false);
+        disableP2p = sharedPreferences.getBoolean("disable_p2p", false);
         if (diagOverlayEnabled || sharedPreferences.getBoolean("debug_mode", false)) {
             try {
                 WebView.setWebContentsDebuggingEnabled(true);
@@ -752,6 +751,19 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
+            @Override
+            public void onReceivedHttpError(com.tencent.smtt.sdk.WebView webView,
+                    com.tencent.smtt.export.external.interfaces.WebResourceRequest request,
+                    com.tencent.smtt.export.external.interfaces.WebResourceResponse errorResponse) {
+                try {
+                    if (request != null && request.isForMainFrame()) {
+                        addEvent("httpErr " + (errorResponse == null ? -1 : errorResponse.getStatusCode()) + " "
+                                + shortUrl(String.valueOf(request.getUrl())));
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
             // 系统Webview内核代码
             // @Override
             // public void onReceivedSslError(WebView view, SslErrorHandler handler,
@@ -765,8 +777,8 @@ public class MainActivity extends AppCompatActivity {
                     super.onPageStarted(view, url, favicon);
                     return;
                 }
-                if (disableLowDelay) {
-                    view.evaluateJavascript(LOW_DELAY_OFF_JS, null);
+                if ((disableLowDelay || disableP2p) && currentLiveIndex <= 19) {
+                    view.evaluateJavascript(buildEarlyGuardJs(), null);
                 }
                 if (allowImages) {
                     view.evaluateJavascript("window.__cctvAllowImages=true;", null);
@@ -874,6 +886,19 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
+            @Override
+            public void onReceivedHttpError(com.tencent.smtt.sdk.WebView webView,
+                    com.tencent.smtt.export.external.interfaces.WebResourceRequest request,
+                    com.tencent.smtt.export.external.interfaces.WebResourceResponse errorResponse) {
+                try {
+                    if (request != null && request.isForMainFrame()) {
+                        addEvent("httpErr " + (errorResponse == null ? -1 : errorResponse.getStatusCode()) + " "
+                                + shortUrl(String.valueOf(request.getUrl())));
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
             // 系统Webview内核代码
             // @Override
             // public void onReceivedSslError(WebView view, SslErrorHandler handler,
@@ -887,8 +912,8 @@ public class MainActivity extends AppCompatActivity {
                     super.onPageStarted(view, url, favicon);
                     return;
                 }
-                if (disableLowDelay) {
-                    view.evaluateJavascript(LOW_DELAY_OFF_JS, null);
+                if ((disableLowDelay || disableP2p) && currentLiveIndex <= 19) {
+                    view.evaluateJavascript(buildEarlyGuardJs(), null);
                 }
                 if (allowImages) {
                     view.evaluateJavascript("window.__cctvAllowImages=true;", null);
@@ -1548,6 +1573,19 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }, 1000);
             }
+
+            // 加载看门狗：20 秒仍未完成则解除"正在切换"状态，避免永久卡住
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                Integer currentGen = viewLoadGeneration.get(target);
+                if (currentGen != null && currentGen.intValue() == generation && isChanging) {
+                    loadingOverlay.setVisibility(View.GONE);
+                    isChanging = false;
+                    addEvent("loadTimeout #" + generation);
+                }
+            }, 20000);
         }
     }
 
@@ -1625,7 +1663,12 @@ public class MainActivity extends AppCompatActivity {
         public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
             try {
                 if (consoleMessage != null && consoleMessage.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
-                    addEvent("JS " + consoleMessage.message());
+                    String source = consoleMessage.sourceId();
+                    String location = "";
+                    if (source != null && !source.isEmpty()) {
+                        location = " @" + shortUrl(source) + ":" + consoleMessage.lineNumber();
+                    }
+                    addEvent("JS " + consoleMessage.message() + location);
                 }
             } catch (Throwable ignored) {
             }
@@ -1764,6 +1807,7 @@ public class MainActivity extends AppCompatActivity {
                     .append(" reload=").append(disableLocalReload ? "off" : "on")
                     .append(" lowq=").append(preferLowQuality ? "on" : "off")
                     .append(" lowdelay=").append(disableLowDelay ? "off" : "on")
+                    .append(" p2p=").append(disableP2p ? "off" : "on")
                     .append(" images=").append(allowImages ? "on" : "off")
                     .append(" resErr=").append(resourceErrorCount)
                     .append('\n');
