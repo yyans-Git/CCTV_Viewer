@@ -365,6 +365,16 @@ public class MainActivity extends AppCompatActivity {
                         window.__cctvLastVideo = v;
                     }
                     out.push('swaps=' + (window.__cctvSwaps || 0));
+                    var ld = '?', p2 = '?', p2js = 0;
+                    try { ld = (typeof isLowDelayLivePlayer !== 'undefined') ? String(isLowDelayLivePlayer) : '?'; } catch (e) { }
+                    try { p2 = (typeof isLiveEnableP2p !== 'undefined') ? String(isLiveEnableP2p) : '?'; } catch (e) { }
+                    try {
+                        if (window.livePlayerObjs && livePlayerObjs['player'] && livePlayerObjs['player'].isLoadP2pJs) {
+                            p2js = 1;
+                        }
+                    } catch (e) { }
+                    out.push('ld=' + ld + ' p2p=' + p2 + '/js' + p2js);
+                    try { out.push('vis=' + (document.visibilityState || '?') + (document.hidden ? '/hidden' : '')); } catch (e) { }
                     if (v) {
                         var buf = -1;
                         try {
@@ -764,6 +774,25 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
+            @Override
+            public com.tencent.smtt.export.external.interfaces.WebResourceResponse shouldInterceptRequest(
+                    com.tencent.smtt.sdk.WebView view,
+                    com.tencent.smtt.export.external.interfaces.WebResourceRequest request) {
+                try {
+                    if (disableP2p && request != null && request.getUrl() != null) {
+                        String requestUrl = request.getUrl().toString();
+                        if (requestUrl.contains("hlsp2p")) {
+                            addEvent("blockP2p");
+                            return new com.tencent.smtt.export.external.interfaces.WebResourceResponse(
+                                    "text/javascript", "utf-8",
+                                    new java.io.ByteArrayInputStream(new byte[0]));
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                return null;
+            }
+
             // 系统Webview内核代码
             // @Override
             // public void onReceivedSslError(WebView view, SslErrorHandler handler,
@@ -897,6 +926,25 @@ public class MainActivity extends AppCompatActivity {
                     }
                 } catch (Throwable ignored) {
                 }
+            }
+
+            @Override
+            public com.tencent.smtt.export.external.interfaces.WebResourceResponse shouldInterceptRequest(
+                    com.tencent.smtt.sdk.WebView view,
+                    com.tencent.smtt.export.external.interfaces.WebResourceRequest request) {
+                try {
+                    if (disableP2p && request != null && request.getUrl() != null) {
+                        String requestUrl = request.getUrl().toString();
+                        if (requestUrl.contains("hlsp2p")) {
+                            addEvent("blockP2p");
+                            return new com.tencent.smtt.export.external.interfaces.WebResourceResponse(
+                                    "text/javascript", "utf-8",
+                                    new java.io.ByteArrayInputStream(new byte[0]));
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                return null;
             }
 
             // 系统Webview内核代码
