@@ -153,6 +153,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean allowImages = false;
     private boolean disableP2p = false;
     private boolean delayPlaylist = false;
+    private boolean disableAv1 = false;
     private int resourceErrorCount = 0;
     private int playlistTrimCount = 0;
     private int playlistTrimErrors = 0;
@@ -306,10 +307,18 @@ public class MainActivity extends AppCompatActivity {
                     try {
                         var orig = window[name];
                         if (typeof orig === 'function' && !orig.__cctvWrapped) {
-                            var f = function () {
-                                window.__cctvHooks[name] = (window.__cctvHooks[name] || 0) + 1;
-                                return orig.apply(this, arguments);
-                            };
+                            var f;
+                            if (name === 'isLiveAV1Supported' && window.__cctvDisableAv1) {
+                                f = function () {
+                                    window.__cctvHooks[name] = (window.__cctvHooks[name] || 0) + 1;
+                                    return false;
+                                };
+                            } else {
+                                f = function () {
+                                    window.__cctvHooks[name] = (window.__cctvHooks[name] || 0) + 1;
+                                    return orig.apply(this, arguments);
+                                };
+                            }
                             f.__cctvWrapped = true;
                             window[name] = f;
                         }
@@ -319,6 +328,7 @@ public class MainActivity extends AppCompatActivity {
                     if (tries++ > 120) { return; }
                     wrap('createH5LivePlayerElement');
                     wrap('parseLiveDataFromVdnWhenError');
+                    wrap('isLiveAV1Supported');
                     setTimeout(tick, 500);
                 }
                 tick();
@@ -379,6 +389,20 @@ public class MainActivity extends AppCompatActivity {
                     } catch (e) { }
                     out.push('ld=' + ld + ' p2p=' + p2 + '/js' + p2js);
                     try { out.push('vis=' + (document.visibilityState || '?') + (document.hidden ? '/hidden' : '')); } catch (e) { }
+                    try {
+                        var vprobe = document.createElement('video');
+                        out.push('av1sup=' + (vprobe.canPlayType ? (vprobe.canPlayType('video/mp4; codecs="av01.0.05M.08"') || 'no') : '?'));
+                    } catch (e) { }
+                    try {
+                        if (window.livePlayerObjs && livePlayerObjs['player']) {
+                            var pobj = livePlayerObjs['player'];
+                            out.push('stype=' + (pobj.streamType || '?'));
+                            if (pobj.manifest) {
+                                var keys = Object.keys(pobj.manifest).join(',');
+                                out.push('man=' + (keys.length > 60 ? keys.substring(0, 60) : keys));
+                            }
+                        }
+                    } catch (e) { }
                     if (v) {
                         var buf = -1;
                         try {
@@ -518,6 +542,7 @@ public class MainActivity extends AppCompatActivity {
         allowImages = sharedPreferences.getBoolean("allow_images", false);
         disableP2p = sharedPreferences.getBoolean("disable_p2p", false);
         delayPlaylist = sharedPreferences.getBoolean("delay_playlist", false);
+        disableAv1 = sharedPreferences.getBoolean("disable_av1", false);
         if (diagOverlayEnabled || sharedPreferences.getBoolean("debug_mode", false)) {
             try {
                 WebView.setWebContentsDebuggingEnabled(true);
@@ -781,24 +806,17 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public com.tencent.smtt.export.external.interfaces.WebResourceResponse shouldInterceptRequest(
+                    com.tencent.smtt.sdk.WebView view, String url) {
+                return handleInterceptRequest(url);
+            }
+
+            @Override
+            public com.tencent.smtt.export.external.interfaces.WebResourceResponse shouldInterceptRequest(
                     com.tencent.smtt.sdk.WebView view,
                     com.tencent.smtt.export.external.interfaces.WebResourceRequest request) {
                 try {
                     if (request != null && request.getUrl() != null) {
-                        String requestUrl = request.getUrl().toString();
-                        if (disableP2p && requestUrl.contains("hlsp2p")) {
-                            addEvent("blockP2p");
-                            return new com.tencent.smtt.export.external.interfaces.WebResourceResponse(
-                                    "text/javascript", "utf-8",
-                                    new java.io.ByteArrayInputStream(new byte[0]));
-                        }
-                        if (delayPlaylist && requestUrl.contains(".m3u8")) {
-                            com.tencent.smtt.export.external.interfaces.WebResourceResponse response =
-                                    interceptPlaylist(requestUrl);
-                            if (response != null) {
-                                return response;
-                            }
-                        }
+                        return handleInterceptRequest(request.getUrl().toString());
                     }
                 } catch (Throwable ignored) {
                 }
@@ -820,6 +838,9 @@ public class MainActivity extends AppCompatActivity {
                 }
                 if ((disableLowDelay || disableP2p) && currentLiveIndex <= 19) {
                     view.evaluateJavascript(buildEarlyGuardJs(), null);
+                }
+                if (disableAv1 && currentLiveIndex <= 19) {
+                    view.evaluateJavascript("window.__cctvDisableAv1=true;", null);
                 }
                 if (allowImages) {
                     view.evaluateJavascript("window.__cctvAllowImages=true;", null);
@@ -946,24 +967,17 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public com.tencent.smtt.export.external.interfaces.WebResourceResponse shouldInterceptRequest(
+                    com.tencent.smtt.sdk.WebView view, String url) {
+                return handleInterceptRequest(url);
+            }
+
+            @Override
+            public com.tencent.smtt.export.external.interfaces.WebResourceResponse shouldInterceptRequest(
                     com.tencent.smtt.sdk.WebView view,
                     com.tencent.smtt.export.external.interfaces.WebResourceRequest request) {
                 try {
                     if (request != null && request.getUrl() != null) {
-                        String requestUrl = request.getUrl().toString();
-                        if (disableP2p && requestUrl.contains("hlsp2p")) {
-                            addEvent("blockP2p");
-                            return new com.tencent.smtt.export.external.interfaces.WebResourceResponse(
-                                    "text/javascript", "utf-8",
-                                    new java.io.ByteArrayInputStream(new byte[0]));
-                        }
-                        if (delayPlaylist && requestUrl.contains(".m3u8")) {
-                            com.tencent.smtt.export.external.interfaces.WebResourceResponse response =
-                                    interceptPlaylist(requestUrl);
-                            if (response != null) {
-                                return response;
-                            }
-                        }
+                        return handleInterceptRequest(request.getUrl().toString());
                     }
                 } catch (Throwable ignored) {
                 }
@@ -985,6 +999,9 @@ public class MainActivity extends AppCompatActivity {
                 }
                 if ((disableLowDelay || disableP2p) && currentLiveIndex <= 19) {
                     view.evaluateJavascript(buildEarlyGuardJs(), null);
+                }
+                if (disableAv1 && currentLiveIndex <= 19) {
+                    view.evaluateJavascript("window.__cctvDisableAv1=true;", null);
                 }
                 if (allowImages) {
                     view.evaluateJavascript("window.__cctvAllowImages=true;", null);
@@ -1884,6 +1901,7 @@ public class MainActivity extends AppCompatActivity {
                     .append(" lowdelay=").append(disableLowDelay ? "off" : "on")
                     .append(" p2p=").append(disableP2p ? "off" : "on")
                     .append(" delay=").append(delayPlaylist ? "on" : "off")
+                    .append(" av1=").append(disableAv1 ? "off" : "on")
                     .append(" images=").append(allowImages ? "on" : "off")
                     .append(" resErr=").append(resourceErrorCount)
                     .append(" pl=").append(playlistTrimCount)
@@ -1929,6 +1947,26 @@ public class MainActivity extends AppCompatActivity {
         } catch (Throwable t) {
             return url == null ? "" : (url.length() > 60 ? url.substring(0, 60) : url);
         }
+    }
+
+    // 拦截入口：P2P 脚本屏蔽 + 直播分片列表延迟（两个 shouldInterceptRequest 签名共用）
+    private com.tencent.smtt.export.external.interfaces.WebResourceResponse handleInterceptRequest(String requestUrl) {
+        try {
+            if (requestUrl == null) {
+                return null;
+            }
+            if (disableP2p && requestUrl.contains("hlsp2p")) {
+                addEvent("blockP2p");
+                return new com.tencent.smtt.export.external.interfaces.WebResourceResponse(
+                        "text/javascript", "utf-8",
+                        new java.io.ByteArrayInputStream(new byte[0]));
+            }
+            if (delayPlaylist && requestUrl.contains(".m3u8")) {
+                return interceptPlaylist(requestUrl);
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     // 直播缓冲增强：拦截媒体 m3u8，去掉最新的 N 个分片，让播放器落后直播边缘约 N*4 秒，换取稳定缓冲

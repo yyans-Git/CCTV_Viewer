@@ -98,6 +98,12 @@
         android:defaultValue="false" />
 
     <SwitchPreference
+        android:key="disable_av1"
+        android:title="禁用AV1编码"
+        android:summary="排查卡顿用：禁止播放器选择 AV1 流（弱芯片上软件解码 AV1 会严重丢帧）（重启生效）"
+        android:defaultValue="false" />
+
+    <SwitchPreference
         android:key="allow_images"
         android:title="允许加载页面图片"
         android:summary="排查用：恢复图片加载，海报/占位图不再显示为破图（重启生效）"
